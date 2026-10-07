@@ -1,8 +1,9 @@
 # Инфраструктура pet-проекта: Kafka (+ веб-интерфейс), RustFS (S3) и ClickHouse.
-# Airflow добавим на этапе 6 через profile, чтобы он не занимал память раньше времени.
+# Airflow запускается отдельно, через profile, чтобы не занимать память без нужды.
 #
 # Шпаргалка (команды выполняются из папки проекта):
-#   docker compose up -d       запустить всё в фоне
+#   docker compose up -d       запустить всё, кроме Airflow
+#   docker compose --profile airflow up -d   то же плюс Airflow
 #   docker compose ps          статус контейнеров
 #   docker compose logs -f kafka   логи одного сервиса (Ctrl+C — выйти)
 #   docker compose stop        остановить, данные сохраняются
@@ -13,6 +14,40 @@
 # Запись ${S3_ACCESS_KEY} значит "подставь значение переменной из .env".
 
 name: pet-pipeline
+
+# ---------------------------------------------------------------- Airflow
+# Общие настройки для всех сервисов Airflow. "&airflow-common" — якорь YAML:
+# ниже сервисы подключают этот блок строкой "<<: *airflow-common",
+# чтобы не повторять одно и то же пять раз.
+# profiles: ["airflow"] — Airflow запускается, только если явно попросить:
+#   docker compose --profile airflow up -d
+x-airflow-common: &airflow-common
+  build: ./airflow                 # собираем образ из airflow/Dockerfile
+  image: pet-pipeline-airflow:latest
+  profiles: ["airflow"]
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor          # задачи выполняются прямо в контейнере scheduler
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"           # без демонстрационных DAG'ов
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"   # новый DAG сначала на паузе
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"   # учебный стенд: вход без логина
+    AIRFLOW__API_AUTH__JWT_SECRET: pet-pipeline-local-jwt-secret
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    # Настройки для наших джоб. Адреса — внутренние имена контейнеров,
+    # а не localhost: задачи выполняются внутри сети Docker.
+    S3_ENDPOINT: http://rustfs:9000
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+    S3_SECRET_KEY: ${S3_SECRET_KEY}
+    CH_HOST: clickhouse
+    CH_PORT: "8123"
+    CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+    CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags     # DAG'и из репозитория
+    - ./jobs:/opt/airflow/jobs             # наши Spark-джобы
+    - airflow_logs:/opt/airflow/logs       # логи задач
+    - spark_ivy_cache:/home/airflow/.ivy2  # кэш jar-пакетов Spark: качаются один раз
+
 
 services:
 
@@ -121,8 +156,66 @@ services:
     volumes:
       - clickhouse_data:/var/lib/clickhouse
 
+  # ------------------------------------------------------------ Airflow: БД
+  # Postgres для служебных данных Airflow: история запусков, статусы задач
+  airflow-postgres:
+    image: postgres:16
+    container_name: airflow-postgres
+    profiles: ["airflow"]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 10
+
+  # Одноразовый сервис: создает таблицы Airflow в Postgres и завершается
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command: airflow db migrate
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+
+  # Веб-интерфейс и API: http://localhost:8080
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: airflow api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Планировщик: решает, когда запускать задачи, и выполняет их (LocalExecutor)
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: airflow scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Читает файлы из dags/ и превращает их в DAG'и, которые видит планировщик
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: airflow dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
 # Именованные volume'ы: Docker хранит их отдельно от контейнеров.
 volumes:
   kafka_data:
   rustfs_data:
   clickhouse_data:
+  airflow_postgres_data:
+  airflow_logs:
+  spark_ivy_cache:
