@@ -1,6 +1,16 @@
-# Инфраструктура проекта: Kafka, RustFS (S3) и ClickHouse.
+# Инфраструктура pet-проекта: Kafka (+ веб-интерфейс), RustFS (S3) и ClickHouse.
 # Airflow добавим на этапе 6 через profile, чтобы он не занимал память раньше времени.
-
+#
+# Шпаргалка (команды выполняются из папки проекта):
+#   docker compose up -d       запустить всё в фоне
+#   docker compose ps          статус контейнеров
+#   docker compose logs -f kafka   логи одного сервиса (Ctrl+C — выйти)
+#   docker compose stop        остановить, данные сохраняются
+#   docker compose down        удалить контейнеры, volume'ы с данными остаются
+#   docker compose down -v     удалить ВСЁ, включая данные Kafka, RustFS и ClickHouse
+#
+# Пароли и логины берутся из файла .env (он лежит рядом и не попадает в git).
+# Запись ${S3_ACCESS_KEY} значит "подставь значение переменной из .env".
 
 name: pet-pipeline
 
@@ -24,6 +34,7 @@ services:
       #   CONTROLLER :9093 — служебный, для управления кластером
       KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094,CONTROLLER://:9093
       # Адреса, которые Kafka сообщает клиентам: "дальше подключайся ко мне вот так".
+      # Если тут ошибиться, клиент подключится, но не сможет читать и писать.
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9094
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
@@ -36,9 +47,13 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       # Новые топики по умолчанию создаются с 3 партициями.
       KAFKA_NUM_PARTITIONS: 3
-      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      # Где Kafka хранит сообщения. Папка подключена к volume ниже,
+      # поэтому топики и сообщения переживают пересоздание контейнера.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
       # Ограничиваем память Java-процесса Kafka (по умолчанию он берет 1 ГБ).
       KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
       # Kafka считается здоровой, когда отвечает на запрос списка топиков.
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
@@ -46,15 +61,30 @@ services:
       timeout: 10s
       retries: 10
 
+  # --------------------------------------------------------------- Kafka UI
+  # Веб-интерфейс для Kafka: топики, партиции, сообщения, consumer group'ы.
+  # Открывается в браузере: http://localhost:8082
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.3.0
+    container_name: kafka-ui
+    ports:
+      - "8082:8080"   # внутри контейнера 8080, снаружи 8082: порт 8080 позже займет Airflow
+    environment:
+      KAFKA_CLUSTERS_0_NAME: pet-pipeline
+      # UI — тоже контейнер, поэтому ходит в Kafka по внутреннему адресу
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      - kafka
+
   # ------------------------------------------------------------ RustFS (S3)
   # Локальная замена AWS S3 с тем же протоколом, поэтому код потом заработает
   # и с настоящим S3, если поменять адрес и ключи.
-  # Изначально тут был MinIO, но он перестал публиковать докер образы.
+  # Изначально тут был MinIO, но он перестал публиковать Docker-образы.
   rustfs:
     image: rustfs/rustfs:1.0.1
     container_name: rustfs
     ports:
-      - "9000:9000"   # S3 API сюда ходят Spark и boto3
+      - "9000:9000"   # S3 API — сюда ходят Spark и boto3
       - "9001:9001"   # веб-консоль: http://localhost:9001
     environment:
       # Логин и пароль берем из .env под общими именами S3_*:
@@ -93,5 +123,6 @@ services:
 
 # Именованные volume'ы: Docker хранит их отдельно от контейнеров.
 volumes:
+  kafka_data:
   rustfs_data:
   clickhouse_data:
