@@ -1,0 +1,97 @@
+# Инфраструктура проекта: Kafka, RustFS (S3) и ClickHouse.
+# Airflow добавим на этапе 6 через profile, чтобы он не занимал память раньше времени.
+
+
+name: pet-pipeline
+
+services:
+
+  # ------------------------------------------------------------------ Kafka
+  # Брокер сообщений. Режим KRaft: один контейнер сам себе и брокер,
+  # и контроллер кластера, отдельный Zookeeper не нужен.
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    ports:
+      - "9094:9094"   # внешний вход: для кода из WSL, адрес localhost:9094
+    environment:
+      CLUSTER_ID: "pet-pipeline-kafka-01"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Три "входа" (listener'а) в Kafka:
+      #   INTERNAL   :9092 — для других контейнеров (Airflow), адрес kafka:9092
+      #   EXTERNAL   :9094 — для локального кода из WSL, адрес localhost:9094
+      #   CONTROLLER :9093 — служебный, для управления кластером
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      # Адреса, которые Kafka сообщает клиентам: "дальше подключайся ко мне вот так".
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # Брокер один, поэтому служебные топики хранятся в одной копии.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Новые топики по умолчанию создаются с 3 партициями.
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      # Ограничиваем память Java-процесса Kafka (по умолчанию он берет 1 ГБ).
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    healthcheck:
+      # Kafka считается здоровой, когда отвечает на запрос списка топиков.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ------------------------------------------------------------ RustFS (S3)
+  # Локальная замена AWS S3 с тем же протоколом, поэтому код потом заработает
+  # и с настоящим S3, если поменять адрес и ключи.
+  # Изначально тут был MinIO, но он перестал публиковать докер образы.
+  rustfs:
+    image: rustfs/rustfs:1.0.1
+    container_name: rustfs
+    ports:
+      - "9000:9000"   # S3 API сюда ходят Spark и boto3
+      - "9001:9001"   # веб-консоль: http://localhost:9001
+    environment:
+      # Логин и пароль берем из .env под общими именами S3_*:
+      # коду не важно, какое именно S3-хранилище стоит за адресом.
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - rustfs_data:/data   # файлы бакетов переживают перезапуск контейнера
+
+  # ------------------------------------------------------------- ClickHouse
+  # Колоночная аналитическая СУБД, здесь будут таблицы и метрики.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: clickhouse
+    ports:
+      # HTTP-порт: веб-редактор http://localhost:8123/play, clickhouse-connect, JDBC.
+      # Нативный порт 9000 наружу не публикуем: на 9000 уже сидит RustFS,
+      # а внутри сети Docker они друг другу не мешают.
+      - "8123:8123"
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      # ClickHouse держит открытыми много файлов одновременно.
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+
+# Именованные volume'ы: Docker хранит их отдельно от контейнеров.
+volumes:
+  rustfs_data:
+  clickhouse_data:
