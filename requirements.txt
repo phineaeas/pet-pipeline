@@ -1,0 +1,9 @@
+# Python-зависимости для локального запуска (conda-окружение pipeline, Python 3.11)
+pyspark==3.5.9
+pandas<3
+pyarrow
+jupyterlab
+confluent-kafka
+clickhouse-connect
+boto3
+python-dotenv
